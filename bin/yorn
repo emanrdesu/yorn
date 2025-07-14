@@ -1,0 +1,196 @@
+#!/usr/bin/env ruby
+
+# frozen_string_literal: true
+
+### yorn is a program for managing journals (yornals)
+### uses git for version control
+
+require "emanlib"
+require "optimist"
+require "openssl"
+
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+
+require "stdlib"
+require "misc"
+require "yornal"
+require "entry"
+require "format"
+require "parse"
+require "validate"
+require "options"
+
+### globals
+
+DEPTH = {
+  box: 0,
+  year: 1,
+  month: 2,
+  day: 3,
+  hour: 4,
+  minute: 5, min: 5,
+}
+
+SHA256 = OpenSSL::Digest.new("SHA256")
+
+# system "rm -rf ~/.yornal.testing 2> /dev/null"
+# ENV["YORNAL_PATH"] = File.expand_path "~/.yornal.testing"
+
+data_dir = File.expand_path (ENV["XDG_DATA_HOME"] or "~/.cache") + "/yornal"
+path = (ENV["YORNAL_PATH"] or data_dir or "~/.yornal")
+$yornalPath = File.expand_path path
+$dotyornal = [$yornalPath, ".yornal"].jomp("/")
+
+if ARGV[0] == "git"
+  die do
+    if Dir.exist?($yornalPath)
+      Dir.chdir $yornalPath
+      system ARGV.join " "
+    else
+      err "Yornal repository does not exist."
+    end
+  end
+end
+
+opts = Optimist.options do
+  $options.each do |option, hash|
+    opt option, $options[option][:syntax],
+        type: :string, **hash
+  end
+
+  opt :delete, "Delete selected entries or yornal"
+  opt :yes, "Assume yes when asked a question"
+  opt :usage, "Print example flag usage", type: :string, default: "all"
+  opt :full_path, "Print absolute path when printing paths", short: :F
+  opt :init, "Initialize yornal repository. Affected by YORNAL_PATH environment variable"
+
+  $options.each_key do |option|
+    [[:add], [:init], [:usage], %i[create type]]
+      .each do |set|
+      set.each { |o| conflicts o, option unless set.any? option }
+    end
+  end
+
+  conflicts :last, :first
+  conflicts :print, :print_path, :delete, :edit, :view
+end
+
+$given = opts.keys
+             .filter { |o| o =~ /given/ }
+             .map { |s| s.to_s[0..(-7)].to_sym }
+
+def given?(option)
+  $given.any? option
+end
+
+if $given == [:init]
+  err "Yornal repository already exists" if Dir.exist? [$yornalPath, ".git"].join("/")
+
+  mkdir $yornalPath
+  Dir.chdir $yornalPath
+  system "find . -type d -exec rm -rf {} 2> /dev/null"
+  git(:init)
+  File.open($dotyornal, "w") { |f| f.print "{}" }
+  git(:add, $dotyornal)
+  git(:commit, "-m 'Create yornal repository'")
+  die
+end
+
+if Dir.exist? $yornalPath
+  Dir.chdir $yornalPath
+
+  Dir.exist?(".git") or
+    err "Yornal repository not set up for version control. See --init"
+
+  File.exist?($dotyornal) or
+    err ".yornal file does not exist. Manually create it."
+else
+  puts "Yornal repository does not exist."
+  puts "Use --init for repository creation."
+  die
+end
+
+if $given == [:usage]
+  die do
+    $options[opts[:usage].to_sym]
+      .when(Hash) do |hash|
+      puts Format.examples(opts[:usage], hash)
+    end
+      .default do
+      opts[:usage] == "all" or err("unrecognized flag '#{opts[:usage]}'")
+      $options.each do |option, hash|
+        Format.examples(option.to_s.gsub("_", "-"), hash)
+              .when(String) do |x|
+          puts x
+          puts
+        end
+      end
+    end
+  end
+end
+
+if [[:create], %i[create type]].any? { |x| x.union($given) == $given.sort }
+  die do
+    Parse.yornalType(opts[:type])
+         .when(Array) do |type|
+      Yornal.create(opts[:create], type[0])
+    end
+      .default { err "invalid type '#{opts[:type]}'" }
+  end
+end
+
+$yornalName = ARGV[0]
+(Yornal.report and die) if $given.empty? && !$yornalName
+$yornalName or err "yornal name must be given, see --usage"
+Yornal.list.keys.any? $yornalName or err "yornal '#{$yornalName}' does not exist"
+$yornal = Yornal.new($yornalName)
+
+($yornal.edit and die) if $given.empty?
+
+if $given == [:add]
+  die do
+    add = Format.monthswap(opts[:add])
+    Validate.entryLiteral(add)
+    $yornal.edit(editor, Time.new(*add.split("/")))
+  end
+end
+
+if [%i[delete yes], [:delete]].any? { |x| x.union($given) == $given.sort }
+  Yornal.delete($yornalName, !opts[:yes]) and die
+end
+
+$query = Format.monthswap(opts[:query])
+Validate.queryFlag $query
+
+$entries = $yornal.entries($query)
+
+if given?(:first) || given?(:last)
+  method = given?(:first) ? :first : :last
+  type, seconds = Parse.lastFirstFlag(opts[method])
+  $entries = [$yornal.send(method, type, seconds, $entries)].flatten
+end
+
+$entries.filter! { |e| e.contains? opts[:match] } if given?(:match)
+$entries.filter! { |e| e.matches? opts[:regex] } if given?(:regex)
+
+die if $entries.empty?
+
+%i[print print_path].each { |p| opts[p] = Format.special(opts[p]) }
+
+%i[print print_path delete edit view]
+  .intersection($given).empty?
+  .when(false) do
+  given?(:print) and $entries.each { |e| e.printout(opts[:print]) }
+  given?(:print_path) and
+    $entries.each { |e| e.printpath(opts[:print_path], opts[:full_path]) }
+  given?(:delete) and $entries.each { |e| e.delete(!opts[:yes]) }
+  given?(:edit) and $yornal.edit(editor, Parse.editFlag(opts[:edit], $entries))
+  given?(:view) and $yornal.edit(pager, Parse.entrySpec(opts[:view], $entries))
+  die
+end
+
+if $entries.size == 1 && !given?(:query)
+  $entries.pop.edit
+else
+  $entries.each { |e| e.printpath(opts[:print_path], opts[:full_path]) }
+end
